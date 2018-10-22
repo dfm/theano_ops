@@ -4,15 +4,15 @@ from __future__ import division, print_function
 
 __all__ = [
     "Term", "TermSum", "TermProduct", "TermDiff",
-    "RealTerm", "ComplexTerm", "SHOTerm", "Matern32Term",
+    "RealTerm", "ComplexTerm",
+    "OverdampedSHOTerm", "UnderdampedSHOTerm", "Matern32Term",
 ]
 
-from math import sqrt
+import numpy as np
 from itertools import chain
 
 import theano
 import theano.tensor as tt
-from theano.ifelse import ifelse
 
 
 class Term(object):
@@ -87,6 +87,33 @@ class Term(object):
         ), axis=1)
 
         return a, U, V, P
+
+    def to_dense(self, x, diag):
+        K = self.value(x[:, None] - x[None, :])
+        K += tt.diag(diag)
+        return K
+
+    def psd(self, omega):
+        ar, cr, ac, bc, cc, dc = self.get_coefficients()
+        omega = tt.reshape(omega, tt.concatenate([omega.shape, [1]]),
+                           ndim=omega.ndim+1)
+        w2 = omega**2
+        w02 = cc**2 + dc**2
+        power = tt.sum(ar * cr / (cr**2 + w2), axis=-1)
+        power += tt.sum(((ac*cc+bc*dc)*w02+(ac*cc-bc*dc)*w2) /
+                        (w2*w2 + 2.0*(cc**2-dc**2)*w2+w02*w02), axis=-1)
+        return np.sqrt(2.0 / np.pi) * power
+
+    def value(self, tau):
+        ar, cr, ac, bc, cc, dc = self.get_coefficients()
+        tau = tt.abs_(tau)
+        tau = tt.reshape(tau, tt.concatenate([tau.shape, [1]]),
+                         ndim=tau.ndim+1)
+        K = tt.sum(ar * tt.exp(-cr*tau), axis=-1)
+        factor = tt.exp(-cc*tau)
+        K += tt.sum(ac * factor * tt.cos(dc*tau), axis=-1)
+        K += tt.sum(bc * factor * tt.sin(dc*tau), axis=-1)
+        return K
 
 
 class TermSum(Term):
@@ -204,40 +231,48 @@ class ComplexTerm(Term):
         )
 
 
-class SHOTerm(Term):
+class OverdampedSHOTerm(Term):
 
     parameter_names = ("S0", "w0", "Q")
 
+    def __init__(self, *args, **kwargs):
+        self.eps = tt.as_tensor_variable(kwargs.pop("eps", 1e-5))
+        super(OverdampedSHOTerm, self).__init__(*args, **kwargs)
+
     def get_coefficients(self):
-        def true_fn():
-            f = tt.sqrt(4.0*self.Q**2 - 1.0)
-            a = self.S0 * self.w0 * self.Q
-            c = 0.5 * self.w0 / self.Q
-            return (
-                tt.zeros(0, dtype=self.dtype),
-                tt.zeros(0, dtype=self.dtype),
-                tt.reshape(a, (a.size,)),
-                tt.reshape(a / f, (a.size,)),
-                tt.reshape(c, (c.size,)),
-                tt.reshape(c * f, (c.size,)),
-            )
+        Q = tt.maximum(self.Q, 0.5+self.eps)
+        f = tt.sqrt(4.0*Q**2 - 1.0)
+        a = self.S0 * self.w0 * Q
+        c = 0.5 * self.w0 / Q
+        return (
+            tt.zeros(0, dtype=self.dtype),
+            tt.zeros(0, dtype=self.dtype),
+            tt.reshape(a, (a.size,)),
+            tt.reshape(a / f, (a.size,)),
+            tt.reshape(c, (c.size,)),
+            tt.reshape(c * f, (c.size,)),
+        )
 
-        def false_fn():
-            f = tt.sqrt(1.0 - 4.0*self.Q**2)
-            return (
-                0.5*self.S0*self.w0*self.Q*tt.stack(
-                    [1.0+1.0/f, 1.0-1.0/f]),
-                0.5*self.w0/self.Q*tt.stack([1.0-f, 1.0+f]),
-                tt.zeros(0, dtype=self.dtype),
-                tt.zeros(0, dtype=self.dtype),
-                tt.zeros(0, dtype=self.dtype),
-                tt.zeros(0, dtype=self.dtype),
-            )
 
-        m = self.Q >= 0.5
-        args_true = true_fn()
-        args_false = false_fn()
-        return [ifelse(m, a, b) for a, b in zip(args_true, args_false)]
+class UnderdampedSHOTerm(Term):
+
+    parameter_names = ("S0", "w0", "Q")
+
+    def __init__(self, *args, **kwargs):
+        self.eps = tt.as_tensor_variable(kwargs.pop("eps", 1e-5))
+        super(OverdampedSHOTerm, self).__init__(*args, **kwargs)
+
+    def get_coefficients(self):
+        Q = tt.minimum(self.Q, 0.5-self.eps)
+        f = tt.sqrt(1.0 - 4.0*Q**2)
+        return (
+            0.5*self.S0*self.w0*Q*tt.stack([1.0+1.0/f, 1.0-1.0/f]),
+            0.5*self.w0/Q*tt.stack([1.0-f, 1.0+f]),
+            tt.zeros(0, dtype=self.dtype),
+            tt.zeros(0, dtype=self.dtype),
+            tt.zeros(0, dtype=self.dtype),
+            tt.zeros(0, dtype=self.dtype),
+        )
 
 
 class Matern32Term(Term):
@@ -252,7 +287,7 @@ class Matern32Term(Term):
         self.eps = tt.cast(eps, self.dtype)
 
     def get_complex_coefficients(self):
-        w0 = sqrt(3.0) / self.rho
+        w0 = np.sqrt(3.0) / self.rho
         S0 = self.sigma**2 / w0
         return (
             tt.reshape(w0*S0, (w0.size,)),
