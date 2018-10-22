@@ -2,7 +2,7 @@
 
 from __future__ import division, print_function
 
-__all__ = ["KeplerOp"]
+__all__ = ["KeplerOp", "sky_position"]
 
 import numpy as np
 
@@ -13,10 +13,12 @@ import theano.tensor as tt
 
 class KeplerOp(gof.Op):
 
-    def __init__(self, *args, **kwargs):
-        self.tol = kwargs.pop("tol", 1.0e-8)
-        self.maxiter = kwargs.pop("maxiter", 2000)
-        super(KeplerOp, self).__init__(*args, **kwargs)
+    __props__ = ("tol", "maxiter")
+
+    def __init__(self, tol=1e-8, maxiter=2000, **kwargs):
+        self.tol = tol
+        self.maxiter = maxiter
+        super(KeplerOp, self).__init__(**kwargs)
 
     def make_node(self, mean_anom, eccen):
         output_var = tt.TensorType(
@@ -124,3 +126,37 @@ class KeplerOp(gof.Op):
         """
 
         return c_code % locals()
+
+
+def sky_position(period, t0, e, omega, incl, t, **kwargs):
+    # Shorthands
+    n = 2.0 * np.pi / period
+    cos_omega = tt.cos(omega)
+    sin_omega = tt.sin(omega)
+
+    # Find the reference time that puts the center of transit at t0
+    E0 = 2.0 * tt.atan2(tt.sqrt(1.0 - e) * cos_omega,
+                        tt.sqrt(1.0 + e) * (1.0 + sin_omega))
+    tref = t0 - (E0 - e * tt.sin(E0)) / n
+
+    # Solve Kepler's equation for the true anomaly
+    M = (t - tref) * n
+    kepler = KeplerOp(**kwargs)
+    E = kepler(M, e + tt.zeros_like(M))
+    f = 2.0 * tt.atan2(tt.sqrt(1.0 + e) * tt.tan(0.5*E),
+                       tt.sqrt(1.0 - e) + tt.zeros_like(E))
+
+    # Rotate into sky coordinates
+    cf = tt.cos(f)
+    sf = tt.sin(f)
+    swpf = sin_omega * cf + cos_omega * sf
+    cwpf = cos_omega * cf - sin_omega * sf
+
+    # Star / planet distance
+    r = (1.0 - e**2) / (1 + e * cf)
+
+    return tt.stack([
+        -r * cwpf,
+        -r * swpf * tt.cos(incl),
+        r * swpf * tt.sin(incl)
+    ])
