@@ -5,7 +5,7 @@ from __future__ import division, print_function
 __all__ = [
     "Term", "TermSum", "TermProduct", "TermDiff",
     "RealTerm", "ComplexTerm",
-    "OverdampedSHOTerm", "UnderdampedSHOTerm", "Matern32Term",
+    "SHOTerm", "Matern32Term",
 ]
 
 import numpy as np
@@ -13,6 +13,7 @@ from itertools import chain
 
 import theano
 import theano.tensor as tt
+from theano.ifelse import ifelse
 
 
 class Term(object):
@@ -231,48 +232,44 @@ class ComplexTerm(Term):
         )
 
 
-class OverdampedSHOTerm(Term):
+class SHOTerm(Term):
 
     parameter_names = ("S0", "w0", "Q")
 
     def __init__(self, *args, **kwargs):
         self.eps = tt.as_tensor_variable(kwargs.pop("eps", 1e-5))
-        super(OverdampedSHOTerm, self).__init__(*args, **kwargs)
+        super(SHOTerm, self).__init__(*args, **kwargs)
 
     def get_coefficients(self):
-        Q = tt.maximum(self.Q, 0.5+self.eps)
-        f = tt.sqrt(4.0*Q**2 - 1.0)
-        a = self.S0 * self.w0 * Q
-        c = 0.5 * self.w0 / Q
-        return (
-            tt.zeros(0, dtype=self.dtype),
-            tt.zeros(0, dtype=self.dtype),
-            tt.reshape(a, (a.size,)),
-            tt.reshape(a / f, (a.size,)),
-            tt.reshape(c, (c.size,)),
-            tt.reshape(c * f, (c.size,)),
-        )
+        def overdampled():
+            Q = self.Q
+            f = tt.sqrt(tt.maximum(4.0*Q**2 - 1.0, self.eps))
+            a = self.S0 * self.w0 * Q
+            c = 0.5 * self.w0 / Q
+            return (
+                tt.zeros(0, dtype=self.dtype),
+                tt.zeros(0, dtype=self.dtype),
+                tt.reshape(a, (a.size,)),
+                tt.reshape(a / f, (a.size,)),
+                tt.reshape(c, (c.size,)),
+                tt.reshape(c * f, (c.size,)),
+            )
 
+        def underdamped():
+            Q = self.Q
+            f = tt.sqrt(tt.maximum(1.0 - 4.0*Q**2, self.eps))
+            return (
+                0.5*self.S0*self.w0*Q*tt.stack([1.0+1.0/f, 1.0-1.0/f]),
+                0.5*self.w0/Q*tt.stack([1.0-f, 1.0+f]),
+                tt.zeros(0, dtype=self.dtype),
+                tt.zeros(0, dtype=self.dtype),
+                tt.zeros(0, dtype=self.dtype),
+                tt.zeros(0, dtype=self.dtype),
+            )
 
-class UnderdampedSHOTerm(Term):
-
-    parameter_names = ("S0", "w0", "Q")
-
-    def __init__(self, *args, **kwargs):
-        self.eps = tt.as_tensor_variable(kwargs.pop("eps", 1e-5))
-        super(OverdampedSHOTerm, self).__init__(*args, **kwargs)
-
-    def get_coefficients(self):
-        Q = tt.minimum(self.Q, 0.5-self.eps)
-        f = tt.sqrt(1.0 - 4.0*Q**2)
-        return (
-            0.5*self.S0*self.w0*Q*tt.stack([1.0+1.0/f, 1.0-1.0/f]),
-            0.5*self.w0/Q*tt.stack([1.0-f, 1.0+f]),
-            tt.zeros(0, dtype=self.dtype),
-            tt.zeros(0, dtype=self.dtype),
-            tt.zeros(0, dtype=self.dtype),
-            tt.zeros(0, dtype=self.dtype),
-        )
+        m = self.Q < 0.5
+        return [
+            ifelse(m, a, b) for a, b in zip(underdamped(), overdampled())]
 
 
 class Matern32Term(Term):
